@@ -172,12 +172,23 @@ class VariationalBNN(_SupervisedBNN):
         else:
             self.likelihood_guide = _empty_guide
 
-    def guide(self, x, obs=None):
-        result = self.net_guide(*_as_tuple(x)) or {}
-        result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
+    def guide(self, x, obs=None, anneal_factor: float=1.0):
+        with poutine.scale(scale=anneal_factor):
+            result = self.net_guide(*_as_tuple(x)) or {}
+            result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
         return result
 
-    def fit(self, data_loader, optim, num_epochs, callback=None, num_particles=1, closed_form_kl=True, device=None):
+    def fit(
+            self,
+            data_loader,
+            optim,
+            num_epochs,
+            callback=None,
+            num_particles=1,
+            closed_form_kl=True,
+            device=None,
+            kl_schedule=lambda step_n: 1.0
+        ):
         """Optimizes the variational parameters on data from data_loader using optim for num_epochs.
 
         :param Iterable data_loader: iterable over batches of data, e.g. a torch.utils.data.DataLoader. Assumes that
@@ -193,6 +204,8 @@ class VariationalBNN(_SupervisedBNN):
         :param bool closed_form_kl: whether to use TraceMeanField_ELBO or Trace_ELBO, i.e. calculate KL divergence
             between approximate posterior and prior in closed form or via a Monte Carlo estimate.
         :param torch.device device: optional device to send the data to.
+        :param kl_schedule: function from natural numbers to [0.0, 1.0] that implements a KL annealing schedule.
+            Output is multiplied onto model parameter updates
         """
         old_training_state = self.net.training
         self.net.train(True)
@@ -200,11 +213,14 @@ class VariationalBNN(_SupervisedBNN):
         loss = TraceMeanField_ELBO(num_particles) if closed_form_kl else Trace_ELBO(num_particles)
         svi = SVI(self.model, self.guide, optim, loss=loss)
 
+        nth_step = 0
         for i in range(num_epochs):
             elbo = 0.
             num_batch = 1
             for num_batch, (input_data, observation_data) in enumerate(iter(data_loader), 1):
-                elbo += svi.step(tuple(_to(input_data, device)), tuple(_to(observation_data, device))[0])
+                elbo += svi.step(tuple(_to(input_data, device)), tuple(_to(observation_data, device))[0],
+                        anneal_factor=kl_schedule(nth_step))
+                nth_step += 1
 
             # the callback can stop training by returning True
             if callback is not None and callback(self, i, elbo / num_batch):
