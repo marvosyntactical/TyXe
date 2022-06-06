@@ -177,7 +177,17 @@ class VariationalBNN(_SupervisedBNN):
         result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
         return result
 
-    def fit(self, data_loader, optim, num_epochs, callback=None, num_particles=1, closed_form_kl=True, device=None):
+    def fit(
+            self,
+            data_loader,
+            optim,
+            num_epochs,
+            callback=None,
+            num_particles=1,
+            closed_form_kl=True,
+            device=None,
+            **loss_kwargs,
+        ):
         """Optimizes the variational parameters on data from data_loader using optim for num_epochs.
 
         :param Iterable data_loader: iterable over batches of data, e.g. a torch.utils.data.DataLoader. Assumes that
@@ -193,12 +203,13 @@ class VariationalBNN(_SupervisedBNN):
         :param bool closed_form_kl: whether to use TraceMeanField_ELBO or Trace_ELBO, i.e. calculate KL divergence
             between approximate posterior and prior in closed form or via a Monte Carlo estimate.
         :param torch.device device: optional device to send the data to.
+        :param loss_kwargs: kwargs to give to loss during init
         """
         old_training_state = self.net.training
         self.net.train(True)
 
-        loss = TraceMeanField_ELBO(num_particles) if closed_form_kl else Trace_ELBO(num_particles)
-        svi = SVI(self.model, self.guide, optim, loss=loss)
+        loss = TraceMeanField_ELBO if closed_form_kl else Trace_ELBO
+        svi = SVI(self.model, self.guide, optim, loss=loss(num_particles=num_particles, **loss_kwargs))
 
         for i in range(num_epochs):
             elbo = 0.
@@ -231,9 +242,9 @@ class VariationalBNN(_SupervisedBNN):
 #  the VariationalBNN class. This will however require hiding the likelihood.data site from the guide_builder in the
 #  base class.
 class MCMC_BNN(_BNN):
-    """Supervised BNN class with an interface to pyro's MCMC that is unified with the VariationalBNN class.
-
-        """
+    """
+    Supervised BNN class with an interface to pyro's MCMC that is unified with the VariationalBNN class.
+    """
 
     def __init__(self, net, prior, likelihood, name=""):
         super().__init__(net, prior, name=name)

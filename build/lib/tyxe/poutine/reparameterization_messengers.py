@@ -1,5 +1,6 @@
 from functools import update_wrapper
 from weakref import WeakValueDictionary, WeakKeyDictionary
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -102,8 +103,9 @@ class _ReparameterizationMessenger(Messenger):
             return
 
         if msg["done"]:
-            raise ValueError(f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
+            warnings.warn(f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
                              f"Did you use multiple reparameterization messengers for the same function?")
+            return
 
         args = list(msg["args"])
         kwargs = msg["kwargs"]
