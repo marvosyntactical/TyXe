@@ -6,7 +6,7 @@ import torch
 
 import pyro.nn as pynn
 import pyro.poutine as poutine
-from pyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, MCMC
+from pyro.infer import SVI, Trace_ELBO, TraceMeanField_ELBO, MCMC, JitTrace_ELBO, JitTraceMeanField_ELBO
 
 
 from . import util
@@ -124,8 +124,10 @@ class _SupervisedBNN(GuidedBNN):
         super().__init__(net, prior, net_guide_builder, name=name)
         self.likelihood = likelihood
 
-    def model(self, x, obs=None):
-        predictions = self(*_as_tuple(x))
+    def model(self, x, obs=None, anneal_factor: float=1.0):
+        assert anneal_factor > 0.0, anneal_factor
+        with poutine.scale(scale=anneal_factor):
+            predictions = self(*_as_tuple(x))
         self.likelihood(predictions, obs)
         return predictions
 
@@ -167,12 +169,16 @@ class VariationalBNN(_SupervisedBNN):
         super().__init__(net, prior, likelihood, net_guide_builder, name=name)
         weight_sample_sites = list(util.pyro_sample_sites(self.net))
         if likelihood_guide_builder is not None:
+            # self.likelihood_guide = likelihood_guide_builder(poutine.block(
+            #     self.model, hide=weight_sample_sites + [self.likelihood.data_name]))
             self.likelihood_guide = likelihood_guide_builder(poutine.block(
-                self.model, hide=weight_sample_sites + [self.likelihood.data_name]))
+                    self.likelihood, hide=[self.likelihood.data_name]
+            ))
         else:
             self.likelihood_guide = _empty_guide
 
     def guide(self, x, obs=None, anneal_factor: float=1.0):
+        assert anneal_factor > 0.0, anneal_factor
         with poutine.scale(scale=anneal_factor):
             result = self.net_guide(*_as_tuple(x)) or {}
             result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
@@ -188,6 +194,7 @@ class VariationalBNN(_SupervisedBNN):
             closed_form_kl=True,
             device=None,
             kl_schedule=lambda step_n: 1.0,
+            jit=False,
             **loss_kwargs,
         ):
         """Optimizes the variational parameters on data from data_loader using optim for num_epochs.
@@ -207,15 +214,18 @@ class VariationalBNN(_SupervisedBNN):
         :param torch.device device: optional device to send the data to.
         :param loss_kwargs: kwargs to give to loss during init
         :param kl_schedule: function from natural numbers to [0.0, 1.0] that implements a KL annealing schedule.
-            Output is multiplied onto model parameter updates
+            Output is multiplied onto guide loss. Input is step number, starting at 1.
+        :param jit: use jit version of loss?
         """
         old_training_state = self.net.training
         self.net.train(True)
 
-        loss = TraceMeanField_ELBO if closed_form_kl else Trace_ELBO
+        loss = (JitTraceMeanField_ELBO if jit else TraceMeanField_ELBO) \
+            if closed_form_kl else \
+            (JitTrace_ELBO if jit else Trace_ELBO)
         svi = SVI(self.model, self.guide, optim, loss=loss(num_particles=num_particles, **loss_kwargs))
 
-        nth_step = 0
+        nth_step = 1
         for i in range(num_epochs):
             elbo = 0.
             num_batch = 1
@@ -278,6 +288,7 @@ class MCMC_BNN(_BNN):
         :param dict mcmc_kwargs: keyword arguments for initializing the pyro.infer.mcmc.MCMC object."""
 
         self.kernel = kernel_builder(self.model)
+
         if batch_data:
             input_data, observation_data = data_loader
         else:
@@ -289,6 +300,7 @@ class MCMC_BNN(_BNN):
                 observation_data_list.append(obs_data.to(device))
             input_data = tuple(torch.cat(input_data_lists[i]) for i in range(len(input_data_lists)))
             observation_data = torch.cat(observation_data_list)
+
         self._mcmc = MCMC(self.kernel, num_samples, **mcmc_kwargs)
         self._mcmc.run(input_data, observation_data)
 
