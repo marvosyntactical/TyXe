@@ -40,6 +40,7 @@ class _BNN(pynn.PyroModule):
 
     def __init__(self, net, prior, name=""):
         super().__init__(name)
+
         self.net = net
         pynn.module.to_pyro_module_(self.net)
         self.prior = prior
@@ -57,27 +58,7 @@ class _BNN(pynn.PyroModule):
         self.prior.update_(self.net)
 
 
-class GuidedBNN(_BNN):
-    """Guided BNN class that in addition to the network and prior also has a guide for doing approximate inference
-    over the neural network weights. The guide_builder argument is called on the net after it has been transformed to
-    a PyroModule and returns the pyro guide function that sample from the approximate posterior.
-
-    :param callable guide_builder: callable that takes a probabilistic pyro function with sample statements and returns
-        an object that helps with inference, i.e. a callable guide function that samples from an approximate posterior
-        for variational BNNs or an MCMC kernel for MCMC-based BNNs. May be None for maximum likelihood inference if
-        the prior leaves all parameters of the net as such."""
-
-    def __init__(self, net, prior, guide_builder=None, name=""):
-        super().__init__(net, prior, name=name)
-        self.net_guide = guide_builder(self.net) if guide_builder is not None else _empty_guide
-
-    def guided_forward(self, *args, guide_tr=None, **kwargs):
-        if guide_tr is None:
-            guide_tr = poutine.trace(self.net_guide).get_trace(*args, **kwargs)
-        return poutine.replay(self.net, trace=guide_tr)(*args, **kwargs)
-
-
-class PytorchBNN(GuidedBNN):
+class PytorchBNN(_BNN):
     """Low-level variational BNN class that can serve as a drop-in replacement for an nn.Module.
 
     :param bool closed_form_kl: whether to use TraceMeanField_ELBO or Trace_ELBO as the loss, i.e. calculate KL
@@ -85,7 +66,8 @@ class PytorchBNN(GuidedBNN):
         variational posterior and prior."""
 
     def __init__(self, net, prior, guide_builder=None, name="", closed_form_kl=True):
-        super().__init__(net, prior, guide_builder=guide_builder, name=name)
+        super().__init__(net, prior, name=name)
+        self.net_guide = guide_builder(self.net) if guide_builder is not None else _empty_guide
         self.cached_output = None
         self.cached_kl_loss = None
         self._loss = TraceMeanField_ELBO() if closed_form_kl else Trace_ELBO()
@@ -112,41 +94,81 @@ class PytorchBNN(GuidedBNN):
         return self.cached_output
 
 
-class _SupervisedBNN(GuidedBNN):
-    """Base class for supervised BNNs that defines the interface of the predict method and implements
-    evaluate. Agnostic to the kind of inference performed.
+class _SupervisedBNN(_BNN):
+    """
+    Base class for supervised BNNs that defines
+    the interface of the predict method and implements evaluate.
+    Importantly, this class is agnostic to the kind of inference performed.
 
     :param tyxe.likelihoods.Likelihood likelihood: Likelihood object that implements a forward method including
         a pyro.sample statement for labelled data given neural network predictions and implements logic for aggregating
         multiple predictions and evaluating them."""
 
-    def __init__(self, net, prior, likelihood, net_guide_builder=None, name=""):
-        super().__init__(net, prior, net_guide_builder, name=name)
+    def __init__(self, net, prior, likelihood, name=""):
+        super().__init__(net, prior, name=name)
         self.likelihood = likelihood
 
     def model(self, x, obs=None, anneal_factor: float=1.0):
         assert anneal_factor > 0.0, anneal_factor
         with poutine.scale(scale=anneal_factor):
             predictions = self(*_as_tuple(x))
-        self.likelihood(predictions, obs)
+        predictions = self.likelihood(predictions, obs)
         return predictions
 
-    def evaluate(self, input_data, y, num_predictions=1, aggregate=True, reduction="sum"):
-        """"Utility method for evaluation. Calculates a likelihood-dependent errors measure, e.g. squared errors or
-        mis-classifications and
+    def evaluate(self, input_data, y, num_predictions=1, aggregate=True, reduction="sum", return_type=tuple):
+        """"
+        Utility method for evaluation. Calculates a likelihood-dependent errors measure, e.g.
+        squared errors, in case self.likelihood is Gaussian (Regression)
+        classifications errors, in case self.likelihood is Discrete (Classification)
 
         :param input_data: Inputs to the neural net. Must be a tuple of more than one.
-        :param y: observations, e.g. class labels.
-        :param int num_predictions: number of forward passes.
+        :param y: observations, e.g. class labels in case of classification or N scalars in case of regression.
+        :param int num_predictions: number of forward passes with different weight samples to do.
         :param bool aggregate: whether to aggregate the outputs of the forward passes before evaluating.
         :param str reduction: "sum", "mean" or "none". How to process the tensor of errors. "sum" adds them up,
-            "mean" averages them and "none" simply returns the tensor."""
-        predictions = self.predict(*_as_tuple(input_data), num_predictions=num_predictions, aggregate=aggregate)
-        error = self.likelihood.error(predictions, y, reduction=reduction)
-        ll = self.likelihood.log_likelihood(predictions, y, reduction=reduction)
-        return error, ll
+            "mean" averages them and "none" simply returns the tensor.
+        """
+        self.eval()
+        with torch.no_grad():
+                # only forward through net
+                net_predictions = self.predict(
+                    *_as_tuple(input_data),
+                    num_predictions=num_predictions,
+                    aggregate=aggregate,
+                    net_only=True
+                )
+                aleatoric_uncertainty = self.likelihood.aleatoric_uncertainty(net_predictions)
+                epistemic_uncertainty = self.likelihood.epistemic_uncertainty(net_predictions)
 
-    def predict(self, *input_data, num_predictions=1, aggregate=True):
+                # predictive variance should be = aleatoric + epistemic uncertainty
+                predictive_variance = self.likelihood.aggregate_predictions(net_predictions)[-1]
+
+                nll = - self.likelihood.log_likelihood(net_predictions, y.unsqueeze(0), reduction=reduction)
+
+                # now forward through likelihood for error
+                sampled_predictions = torch.stack([self.likelihood_fwd(pred) for pred in net_predictions])
+
+                error = self.likelihood.error(sampled_predictions, y.unsqueeze(0), reduction=reduction, sample=False)
+
+        self.train()
+
+        if return_type==dict:
+            return {
+                "error": error,
+                "nll": nll,
+                "predictive_variance": predictive_variance,
+                "aleatoric_uncertainty": aleatoric_uncertainty,
+                "epistemic_uncertainty": epistemic_uncertainty,
+            }
+        else:
+            return error, nll, predictive_variance, aleatoric_uncertainty, epistemic_uncertainty
+
+
+
+    def likelihood_fwd(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def predict(self, *input_data, num_predictions=1, aggregate=True, net_only=False):
         """Makes predictions on the input data
 
         :param input_data: inputs to the neural net, e.g. torch.Tensors
@@ -156,17 +178,26 @@ class _SupervisedBNN(GuidedBNN):
 
 
 class VariationalBNN(_SupervisedBNN):
-    """Variational BNN class for supervised problems. Requires a likelihood that describes the data noise and an
+    """
+    Variational BNN class for supervised problems. Requires a likelihood that describes the data noise and an
     optional guide builder for it should it contain any variables that need to be inferred. Provides high-level utility
     method such as fit, predict and
 
+    :param callable guide_builder: callable that takes a probabilistic pyro function with sample statements and returns
+        an object that helps with inference, i.e. a callable guide function that samples from an approximate posterior
+        for variational BNNs or an MCMC kernel for MCMC-based BNNs. May be None for maximum likelihood inference if
+        the prior leaves all parameters of the net as such.
     :param callable net_guide_builder: pyro.infer.autoguide.AutoCallable style class that given a pyro function
         constructs a variational posterior that sample the same unobserved sites from distributions with learnable
         parameters.
     :param callable likelihood_guide_builder: optional callable that constructs a guide for the likelihood if it
-        contains any unknown variable, such as the precision/scale of a Gaussian."""
+        contains any unknown variable, such as the precision/scale of a Gaussian.
+    """
     def __init__(self, net, prior, likelihood, net_guide_builder=None, likelihood_guide_builder=None, name=""):
-        super().__init__(net, prior, likelihood, net_guide_builder, name=name)
+        super().__init__(net, prior, likelihood, name=name)
+        self.net_guide = net_guide_builder(self.net) if net_guide_builder is not None else _empty_guide
+        self.likelihood_fwd = self.guided_likelihood
+
         weight_sample_sites = list(util.pyro_sample_sites(self.net))
         if likelihood_guide_builder is not None:
             # self.likelihood_guide = likelihood_guide_builder(poutine.block(
@@ -183,6 +214,11 @@ class VariationalBNN(_SupervisedBNN):
             result = self.net_guide(*_as_tuple(x)) or {}
             result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
         return result
+
+    def guided_forward(self, *args, guide_tr=None, **kwargs):
+        if guide_tr is None:
+            guide_tr = poutine.trace(self.net_guide).get_trace(*args, **kwargs)
+        return poutine.replay(self.net, trace=guide_tr)(*args, **kwargs)
 
     def fit(
             self,
@@ -225,14 +261,14 @@ class VariationalBNN(_SupervisedBNN):
             (JitTrace_ELBO if jit else Trace_ELBO)
         svi = SVI(self.model, self.guide, optim, loss=loss(num_particles=num_particles, **loss_kwargs))
 
-        nth_step = 1
+        step = 1
         for i in range(num_epochs):
             elbo = 0.
             num_batch = 1
             for num_batch, (input_data, observation_data) in enumerate(iter(data_loader), 1):
                 elbo += svi.step(tuple(_to(input_data, device)), tuple(_to(observation_data, device))[0],
-                        anneal_factor=kl_schedule(nth_step))
-                nth_step += 1
+                        anneal_factor=kl_schedule(step))
+                step += 1
 
             # the callback can stop training by returning True
             if callback is not None and callback(self, i, elbo / num_batch):
@@ -241,37 +277,60 @@ class VariationalBNN(_SupervisedBNN):
         self.net.train(old_training_state)
         return svi
 
-    def predict(self, *input_data, num_predictions=1, aggregate=True, guide_traces=None):
+    def predict(self, *input_data, num_predictions=1, aggregate=True, guide_traces=None, net_only=False):
+        """
+        Args:
+            net_only: only forward guided net, not likelihood
+        """
         if guide_traces is None:
             guide_traces = [None] * num_predictions
 
         preds = []
-        with torch.autograd.no_grad():
+        self.net.eval() # not doing monte carlo dropout
+        with torch.no_grad():
             for trace in guide_traces:
-                preds.append(self.guided_forward(*input_data, guide_tr=trace))
+                """
+                def guided_forward(self, *args, guide_tr=None, **kwargs):
+                    if guide_tr is None:
+                        guide_tr = poutine.trace(self.net_guide).get_trace(*args, **kwargs)
+                    return poutine.replay(self.net, trace=guide_tr)(*args, **kwargs)
+                """
+                pred = self.guided_forward(*input_data, guide_tr=trace)
+                if not aggregate and not net_only:
+                    pred = self.guided_likelihood(pred)
+                preds.append(pred)
+        self.net.train()
         predictions = torch.stack(preds)
-        return self.likelihood.aggregate_predictions(predictions) if aggregate else predictions
+
+        """
+        def guide(self, x, obs=None, anneal_factor: float=1.0):
+            assert anneal_factor > 0.0, anneal_factor
+            with poutine.scale(scale=anneal_factor):
+                result = self.net_guide(*_as_tuple(x)) or {}
+                result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
+            return result
+        """
+
+        return self.likelihood.aggregate_predictions(predictions) if \
+            (aggregate and not net_only) else predictions
+
+    def guided_likelihood(self, *args, guide_tr=None, **kwargs):
+        if guide_tr is None:
+            guide_tr = poutine.trace(self.likelihood_guide).get_trace(*args, **kwargs)
+        return poutine.replay(self.likelihood, trace=guide_tr)(*args, **kwargs)
 
 
-# TODO inherit from _SupervisedBNN to unify the class hierarchy. This will require changing the GuidedBNN baseclass to
-#  construct the guide on top of self.model rather than self.net (model of GuidedBNN could just call the net and
-#  SupervisedBNN adds the likelihood on top) and consequently removing the likelihood_guide_builder parameter for
-#  the VariationalBNN class. This will however require hiding the likelihood.data site from the guide_builder in the
-#  base class.
-class MCMC_BNN(_BNN):
+
+class MCMC_BNN(_SupervisedBNN):
     """
     Supervised BNN class with an interface to pyro's MCMC that is unified with the VariationalBNN class.
     """
 
     def __init__(self, net, prior, likelihood, name=""):
-        super().__init__(net, prior, name=name)
+        super().__init__(net, prior, likelihood, name=name)
         self.likelihood = likelihood
         self._mcmc = None
-
-    def model(self, x, obs=None):
-        predictions = self(*_as_tuple(x))
-        self.likelihood(predictions, obs)
-        return predictions
+        self.likelihood_fwd = self.likelihood
 
     def fit(self, data_loader, num_samples, kernel_builder, device=None, batch_data=False, **mcmc_kwargs):
         """Runs MCMC on the data from data loader using the kernel that was used to instantiate the class.
@@ -306,15 +365,28 @@ class MCMC_BNN(_BNN):
 
         return self._mcmc
 
-    def predict(self, *input_data, num_predictions=1, aggregate=True):
+    def predict(self, *input_data, num_predictions=1, aggregate=True, net_only=False):
+        """
+        Args:
+            net_only: only forward guided net, not likelihood
+        """
         if self._mcmc is None:
             raise RuntimeError("Call .fit to run MCMC and obtain samples from the posterior first.")
 
         preds = []
         weight_samples = self._mcmc.get_samples(num_samples=num_predictions)
+        self.net.eval() # not doing monte carlo dropout
         with torch.no_grad():
             for i in range(num_predictions):
                 weights = {name: sample[i] for name, sample in weight_samples.items()}
-                preds.append(poutine.condition(self, weights)(*input_data))
+                pred = poutine.condition(self, weights)(*input_data)
+                if not aggregate and not net_only:
+                    pred = self.likelihood(pred)
+                preds.append(pred)
+
         predictions = torch.stack(preds)
-        return self.likelihood.aggregate_predictions(predictions) if aggregate else predictions
+        self.net.train()
+        return self.likelihood.aggregate_predictions(predictions) if \
+            (aggregate and not net_only) else predictions
+
+

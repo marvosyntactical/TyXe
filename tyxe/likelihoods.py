@@ -77,10 +77,28 @@ class Likelihood(PyroModule):
         log_probs = self.predictive_distribution(predictions).log_prob(data)
         return _reduce(log_probs, reduction)
 
-    def error(self, predictions, data, aggregation_dim=None, reduction="none"):
+    def error(self, predictions, data, aggregation_dim=None, reduction="none", sample=True):
+        """
+        Args:
+            sample: whether the predictions are to be sampled from (e.g.
+            heteroskedastic gaussian mean, var tensor with shape [N, 2*D])
+            or were already sampled from the likelihood
+            (e.g. heteroskedastic gaussian sample tensor of shape [N, D])
+        """
         if aggregation_dim is not None:
             predictions = self.aggregate_predictions(predictions, aggregation_dim)
-        errors = dist.util.sum_rightmost(self._calc_error(self._point_predictions(predictions), data), self.event_dim)
+
+        if sample:
+            _sample = self._point_predictions
+        else:
+            _sample = lambda x: x
+
+        sampled = _sample(predictions)
+
+        errors = dist.util.sum_rightmost(
+            self._calc_error(sampled, data),
+            self.event_dim
+        )
         return _reduce(errors, reduction)
 
     def sample(self, predictions, sample_shape=torch.Size()):
@@ -104,6 +122,19 @@ class Likelihood(PyroModule):
     def _calc_error(self, point_predictions, data):
         """Typical error measure, e.g. squared errors for Gaussians or number of mis-classifications for Categorical."""
         raise NotImplementedError
+
+    def aleatoric_uncertainty(self, predictions, data, sample_dim=0, reduction="none", sample=True):
+        """
+        """
+        raise NotImplementedError
+
+    def epistemic_uncertainty(self, predictions, data, sample_dim=0, reduction="none", sample=True):
+        """
+        """
+        raise NotImplementedError
+
+
+
 
 
 class _Discrete(Likelihood):
@@ -172,15 +203,21 @@ class Gaussian(Likelihood):
     def _point_predictions(self, predictions):
         return self._predictive_loc_scale(predictions)[0]
 
-    def _calc_error(self, point_predictions, data):
-        return point_predictions.sub(data).pow(2)
+    def _calc_error(self, point_predictions, data, data_dim=0):
+        """RMSE."""
+        n = point_predictions.shape[data_dim]
+        return point_predictions.sub(data).div(n).pow(2)
 
     def _predictive_loc_scale(self, predictions):
         raise NotImplementedError
 
 
+
+
+
 class HeteroskedasticGaussian(Gaussian):
-    """Heteroskedastic Gaussian likelihood, i.e. Gaussian with data-dependent observation noise that is assumed to be
+    """
+    Heteroskedastic Gaussian likelihood, i.e. Gaussian with data-dependent observation noise that is assumed to be
     part of the predictions. For d-dimensional observations, the predictions are expected to be 2d, with the tensor
     of predictions being split in the middle along the final event dim and the first half corresponding to predicted
     means and the second half to the standard deviations (which may be negative, in which case they are passed
@@ -193,22 +230,57 @@ class HeteroskedasticGaussian(Gaussian):
         self.positive_scale = positive_scale
 
     def aggregate_predictions(self, predictions, dim=0):
-        """Aggregates multiple predictions for the same data by averaging them according to their predicted noise.
+        """
+        Aggregates multiple predictions for the same data by averaging them according to their predicted noise.
         Means with lower predicted noise are given higher weight in the average. Predictive variance is the variance
-        of the means plus the average predicted variance."""
+        of the means plus the average predicted variance.
+        """
+        # print("Hetero aggregation start:")
+        # print(predictions.shape)
+
         loc, scale = self._predictive_loc_scale(predictions)
+
+        # print(loc.shape, scale.shape)
+
         precision = scale.pow(-2)
         total_precision = precision.sum(dim)
+
+        # Means with lower predicted noise are given higher weight in the average.
         agg_loc = loc.mul(precision).sum(dim).div(total_precision)
+        # Predictive variance is the variance of the means plus the average predicted variance.
         agg_scale = precision.reciprocal().mean(dim).add(loc.var(dim)).sqrt()
+
         if not self.positive_scale:
             agg_scale = inverse_softplus(agg_scale)
+
+        # print(agg_loc.shape, agg_scale.shape)
+
         return agg_loc, agg_scale # same output format as homoskedasticgaussian
 
     def _predictive_loc_scale(self, predictions):
+        # # print("predictions shape:",predictions.shape)
         loc, pred_scale = predictions.chunk(2, dim=-1)
         scale = pred_scale if self.positive_scale else F.softplus(pred_scale)
         return loc, scale
+
+    def aleatoric_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, 2D]
+        Aleatoric Uncertainty is simply the predicted variance.
+        """
+        _, pred_scale = predictions.chunk(2, dim=-1)
+        return pred_scale.mean(dim=sample_dim)
+
+    def epistemic_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, 2D]
+        Epistemic Uncertainty is the variance over the sample dim of means
+        """
+        loc, _ = predictions.chunk(2, dim=-1)
+        return loc.var(dim=sample_dim)
+
+
+
 
 
 class HomoskedasticGaussian(Gaussian):
@@ -216,11 +288,12 @@ class HomoskedasticGaussian(Gaussian):
     or precision may be a distribution, i.e. be unknown and have a prior placed on it for it to be inferred or be a
     PyroParameter in order to be learnable.
 
-    :param scale: tensor, parameter or prior distribution for the scale. Mutually exclusive with precision.
+    :param scale: tensor, parameter or prior distribution for the scale (std). Mutually exclusive with precision.
     :param precision: tensor, parameter or prior distribution for the precision. Mutually exclusive with scale."""
 
     def __init__(self, dataset_size, scale=None, precision=None, event_dim=1, name="", data_name="data"):
         super().__init__(dataset_size, event_dim=event_dim, name=name, data_name=data_name)
+
         if int(scale is None) + int(precision is None) != 1:
             raise ValueError("Exactly one of scale and precision must be specified")
         elif isinstance(scale, (dist.Distribution, torchdist.Distribution)):
@@ -236,10 +309,11 @@ class HomoskedasticGaussian(Gaussian):
             pass
         self.scale = scale
 
-
     def aggregate_predictions(self, predictions, dim=0):
-        """Aggregates multiple predictions for the same data by averaging them. Predictive variance is the variance
-         of the predictions plus the known variance term."""
+        """
+        Aggregates multiple predictions for the same data by averaging them. Predictive variance is the variance
+         of the predictions plus the known variance term.
+         """
         loc = predictions.mean(dim)
         scale = predictions.var(dim).add(self.scale ** 2).sqrt()
         return loc, scale
@@ -251,3 +325,26 @@ class HomoskedasticGaussian(Gaussian):
             loc = predictions
             scale = self.scale
         return loc, scale
+
+    def aleatoric_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, D]
+        Aleatoric Uncertainty is simply the predicted variance.
+        """
+        var = (self.scale ** 2)
+        if len(prediction.shape) <= 1:
+            return var
+        else:
+            return torch.zeros(*predictions.shape[1:]) + var
+
+    def epistemic_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, D]
+        Epistemic Uncertainty is the variance over the sample dim of predicted means.
+
+        (non sampled as in not sampled from likelihood; but sampled from model)
+        """
+        return predictions.var(dim=sample_dim)
+
+
+

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='tyxe',
-    version='0.0.3',
+    version='0.0.5',
     url='https://github.com/karalets/TyXe',
     author=['Hippolyt Ritter', 'Theofanis Karaletsos'],
     author_email='j.ritter@cs.ucl.ac.uk',
