@@ -1,6 +1,7 @@
 from collections import defaultdict
 import itertools
 from operator import itemgetter
+import warnings
 
 import torch
 
@@ -102,7 +103,8 @@ class _SupervisedBNN(_BNN):
 
     :param tyxe.likelihoods.Likelihood likelihood: Likelihood object that implements a forward method including
         a pyro.sample statement for labelled data given neural network predictions and implements logic for aggregating
-        multiple predictions and evaluating them."""
+        multiple predictions and evaluating them.
+    """
 
     def __init__(self, net, prior, likelihood, name=""):
         super().__init__(net, prior, name=name)
@@ -115,8 +117,8 @@ class _SupervisedBNN(_BNN):
         predictions = self.likelihood(predictions, obs)
         return predictions
 
-    def evaluate(self, input_data, y, num_predictions=1, aggregate=True, reduction="sum", return_type=tuple):
-        """"
+    def evaluate(self, input_data, y, num_predictions=1, aggregate=True, reduction="sum", return_type=tuple, **kwargs):
+        """
         Utility method for evaluation. Calculates a likelihood-dependent errors measure, e.g.
         squared errors, in case self.likelihood is Gaussian (Regression)
         classifications errors, in case self.likelihood is Discrete (Classification)
@@ -128,6 +130,7 @@ class _SupervisedBNN(_BNN):
         :param str reduction: "sum", "mean" or "none". How to process the tensor of errors. "sum" adds them up,
             "mean" averages them and "none" simply returns the tensor.
         """
+        # TODO test this function with aggregate=True
         self.eval()
         with torch.no_grad():
                 # only forward through net
@@ -135,20 +138,27 @@ class _SupervisedBNN(_BNN):
                     *_as_tuple(input_data),
                     num_predictions=num_predictions,
                     aggregate=aggregate,
-                    net_only=True
+                    net_only=True,
+                    **kwargs
                 )
                 aleatoric_uncertainty = self.likelihood.aleatoric_uncertainty(net_predictions)
                 epistemic_uncertainty = self.likelihood.epistemic_uncertainty(net_predictions)
 
-                # predictive variance should be = aleatoric + epistemic uncertainty
+                # NOTE: predictive variance := aleatoric + epistemic uncertainty
                 predictive_variance = self.likelihood.aggregate_predictions(net_predictions)[-1]
 
-                nll = - self.likelihood.log_likelihood(net_predictions, y.unsqueeze(0), reduction=reduction)
+                nll = - self.likelihood.log_likelihood(
+                    net_predictions, y.unsqueeze(0), reduction=reduction
+                )
 
                 # now forward through likelihood for error
-                sampled_predictions = torch.stack([self.likelihood_fwd(pred) for pred in net_predictions])
+                sampled_predictions = torch.stack(
+                    [self.likelihood_fwd(pred) for pred in net_predictions]
+                )
 
-                error = self.likelihood.error(sampled_predictions, y.unsqueeze(0), reduction=reduction, sample=False)
+                error = self.likelihood.error(
+                    sampled_predictions, y.unsqueeze(0), reduction=reduction, sample=False
+                )
 
         self.train()
 
@@ -159,14 +169,16 @@ class _SupervisedBNN(_BNN):
                 "predictive_variance": predictive_variance,
                 "aleatoric_uncertainty": aleatoric_uncertainty,
                 "epistemic_uncertainty": epistemic_uncertainty,
+                "sampled_predictions": sampled_predictions
             }
         else:
-            return error, nll, predictive_variance, aleatoric_uncertainty, epistemic_uncertainty
+            return error, nll, predictive_variance, \
+                    aleatoric_uncertainty, epistemic_uncertainty, sampled_predictions
 
 
 
-    def likelihood_fwd(self, *args, **kwargs):
-        raise NotImplementedError
+    # def likelihood_fwd(self, *args, **kwargs):
+    #     raise NotImplementedError
 
     def predict(self, *input_data, num_predictions=1, aggregate=True, net_only=False):
         """Makes predictions on the input data
@@ -365,16 +377,23 @@ class MCMC_BNN(_SupervisedBNN):
 
         return self._mcmc
 
-    def predict(self, *input_data, num_predictions=1, aggregate=True, net_only=False):
+    def predict(self, *input_data, num_predictions=1, aggregate=True, weight_samples=None, net_only=False):
         """
         Args:
             net_only: only forward guided net, not likelihood
         """
-        if self._mcmc is None:
-            raise RuntimeError("Call .fit to run MCMC and obtain samples from the posterior first.")
+        if weight_samples is None:
+            if self._mcmc is None:
+                raise RuntimeError("Provide weight samples or call .fit to run MCMC and obtain samples from the posterior first.")
+            weight_samples = self._mcmc.get_samples(num_samples=num_predictions)
+        else:
+            num_samples = len(list(weight_samples.keys())[0])
+            if num_predictions != num_samples:
+                (num_predictions, num_samples)
+            warnings.warn(f"Got num_predictions={num_predictions} and number of weight_samples={num_samples}. Adjusting num_predictions to {num_samples}")
+            num_predictions = num_samples
 
         preds = []
-        weight_samples = self._mcmc.get_samples(num_samples=num_predictions)
         self.net.eval() # not doing monte carlo dropout
         with torch.no_grad():
             for i in range(num_predictions):

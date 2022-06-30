@@ -253,8 +253,6 @@ class HeteroskedasticGaussian(Gaussian):
         if not self.positive_scale:
             agg_scale = inverse_softplus(agg_scale)
 
-        # print(agg_loc.shape, agg_scale.shape)
-
         return agg_loc, agg_scale # same output format as homoskedasticgaussian
 
     def _predictive_loc_scale(self, predictions):
@@ -332,7 +330,7 @@ class HomoskedasticGaussian(Gaussian):
         Aleatoric Uncertainty is simply the predicted variance.
         """
         var = (self.scale ** 2)
-        if len(prediction.shape) <= 1:
+        if len(predictions.shape) <= 1:
             return var
         else:
             return torch.zeros(*predictions.shape[1:]) + var
