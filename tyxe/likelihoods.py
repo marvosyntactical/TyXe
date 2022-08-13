@@ -79,6 +79,9 @@ class Likelihood(PyroModule):
 
     def error(self, predictions, data, aggregation_dim=None, reduction="none", sample=True):
         """
+        Calculates cumulative error across batch,
+        reduced (e.g. averaged) across the sample dimension.
+
         Args:
             sample: whether the predictions are to be sampled from (e.g.
             heteroskedastic gaussian mean, var tensor with shape [N, 2*D])
@@ -95,11 +98,16 @@ class Likelihood(PyroModule):
 
         sampled = _sample(predictions)
 
+        err = self._calc_error(sampled, data)
+
+        # summed across batch dimension
         errors = dist.util.sum_rightmost(
-            self._calc_error(sampled, data),
+            err,
             self.event_dim
         )
-        return _reduce(errors, reduction)
+
+        reduced = _reduce(errors, reduction)
+        return reduced
 
     def sample(self, predictions, sample_shape=torch.Size()):
         return self.predictive_distribution(predictions).sample(sample_shape)
@@ -123,12 +131,12 @@ class Likelihood(PyroModule):
         """Typical error measure, e.g. squared errors for Gaussians or number of mis-classifications for Categorical."""
         raise NotImplementedError
 
-    def aleatoric_uncertainty(self, predictions, data, sample_dim=0, reduction="none", sample=True):
+    def aleatoric_uncertainty(self, predictions, sample_dim=0):
         """
         """
         raise NotImplementedError
 
-    def epistemic_uncertainty(self, predictions, data, sample_dim=0, reduction="none", sample=True):
+    def epistemic_uncertainty(self, predictions, sample_dim=0):
         """
         """
         raise NotImplementedError
@@ -188,6 +196,27 @@ class Categorical(_Discrete):
     def is_binary(self):
         return False
 
+    def aleatoric_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, D]
+        """
+        # D = self.base_dist(logits=predictions)
+        # TODO NOTE figure out aleatoric uncertainty in case of Categorical Distribution:
+        # https://discuss.pytorch.org/t/pytorch-distribution-mean-returns-nan/61978/9
+        return torch.Tensor([-1]).to(device=predictions.device)
+
+    def epistemic_uncertainty(self, predictions, sample_dim=0):
+        """
+        predictions must be non-sampled, i.e. of shape [N, D]
+        Epistemic Uncertainty is the variance over the sample dim of predicted means.
+
+        (non sampled as in not sampled from likelihood; but sampled from model)
+        """
+        return predictions.var(dim=sample_dim)
+
+
+
+
 
 class Gaussian(Likelihood):
     """Base class for Gaussian likelihoods."""
@@ -235,12 +264,8 @@ class HeteroskedasticGaussian(Gaussian):
         Means with lower predicted noise are given higher weight in the average. Predictive variance is the variance
         of the means plus the average predicted variance.
         """
-        # print("Hetero aggregation start:")
-        # print(predictions.shape)
 
         loc, scale = self._predictive_loc_scale(predictions)
-
-        # print(loc.shape, scale.shape)
 
         precision = scale.pow(-2)
         total_precision = precision.sum(dim)
@@ -256,7 +281,6 @@ class HeteroskedasticGaussian(Gaussian):
         return agg_loc, agg_scale # same output format as homoskedasticgaussian
 
     def _predictive_loc_scale(self, predictions):
-        # # print("predictions shape:",predictions.shape)
         loc, pred_scale = predictions.chunk(2, dim=-1)
         scale = pred_scale if self.positive_scale else F.softplus(pred_scale)
         return loc, scale
@@ -330,10 +354,12 @@ class HomoskedasticGaussian(Gaussian):
         Aleatoric Uncertainty is simply the predicted variance.
         """
         var = (self.scale ** 2)
-        if len(predictions.shape) <= 1:
+        if len(predictions.shape) < 1:
             return var
         else:
-            return torch.zeros(*predictions.shape[1:]) + var
+            # act as if we aggregate over sample_dim
+            shape = [dim for num, dim in enumerate(predictions.shape) if num != sample_dim]
+            return torch.zeros(*shape) + var
 
     def epistemic_uncertainty(self, predictions, sample_dim=0):
         """

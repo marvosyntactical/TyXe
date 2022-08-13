@@ -114,10 +114,21 @@ class _SupervisedBNN(_BNN):
         assert anneal_factor > 0.0, anneal_factor
         with poutine.scale(scale=anneal_factor):
             predictions = self(*_as_tuple(x))
-        predictions = self.likelihood(predictions, obs)
+        self.likelihood(predictions, obs)
         return predictions
 
-    def evaluate(self, input_data, y, num_predictions=1, aggregate=True, reduction="sum", return_type=tuple, **kwargs):
+    def evaluate(
+            self,
+            input_data,
+            y,
+            num_predictions=1,
+            aggregate=True,
+            reduction="mean",
+            return_type=tuple,
+            is_classification=False,
+            sample_dim=0,
+            **kwargs
+        ):
         """
         Utility method for evaluation. Calculates a likelihood-dependent errors measure, e.g.
         squared errors, in case self.likelihood is Gaussian (Regression)
@@ -133,6 +144,7 @@ class _SupervisedBNN(_BNN):
         # TODO test this function with aggregate=True
         self.eval()
         with torch.no_grad():
+
                 # only forward through net
                 net_predictions = self.predict(
                     *_as_tuple(input_data),
@@ -141,21 +153,30 @@ class _SupervisedBNN(_BNN):
                     net_only=True,
                     **kwargs
                 )
-                aleatoric_uncertainty = self.likelihood.aleatoric_uncertainty(net_predictions)
-                epistemic_uncertainty = self.likelihood.epistemic_uncertainty(net_predictions)
+
+                aleatoric_uncertainty = self.likelihood.aleatoric_uncertainty(
+                    net_predictions, sample_dim=sample_dim
+                )
+
+                epistemic_uncertainty = self.likelihood.epistemic_uncertainty(
+                    net_predictions, sample_dim=sample_dim
+                )
 
                 # NOTE: predictive variance := aleatoric + epistemic uncertainty
-                predictive_variance = self.likelihood.aggregate_predictions(net_predictions)[-1]
+                if is_classification:
+                    predictive_variance = net_predictions.exp().var(dim=sample_dim)
+                else:
+                    predictive_variance = self.likelihood.aggregate_predictions(net_predictions)[-1]
 
                 nll = - self.likelihood.log_likelihood(
                     net_predictions, y.unsqueeze(0), reduction=reduction
                 )
 
-                # now forward through likelihood for error
-                sampled_predictions = torch.stack(
-                    [self.likelihood_fwd(pred) for pred in net_predictions]
+                sampled_predictions = self.likelihood._point_predictions(
+                    net_predictions
                 )
 
+                # now forward through likelihood for error
                 error = self.likelihood.error(
                     sampled_predictions, y.unsqueeze(0), reduction=reduction, sample=False
                 )
@@ -169,11 +190,12 @@ class _SupervisedBNN(_BNN):
                 "predictive_variance": predictive_variance,
                 "aleatoric_uncertainty": aleatoric_uncertainty,
                 "epistemic_uncertainty": epistemic_uncertainty,
-                "sampled_predictions": sampled_predictions
+                "sampled_predictions": sampled_predictions,
+                "predictions": net_predictions
             }
         else:
             return error, nll, predictive_variance, \
-                    aleatoric_uncertainty, epistemic_uncertainty, sampled_predictions
+                    aleatoric_uncertainty, epistemic_uncertainty, sampled_predictions, net_predictions
 
 
 
@@ -205,8 +227,17 @@ class VariationalBNN(_SupervisedBNN):
     :param callable likelihood_guide_builder: optional callable that constructs a guide for the likelihood if it
         contains any unknown variable, such as the precision/scale of a Gaussian.
     """
-    def __init__(self, net, prior, likelihood, net_guide_builder=None, likelihood_guide_builder=None, name=""):
+    def __init__(self,
+            net,
+            prior,
+            likelihood,
+            net_guide_builder=None,
+            likelihood_guide_builder=None,
+            name=""
+        ):
+
         super().__init__(net, prior, likelihood, name=name)
+
         self.net_guide = net_guide_builder(self.net) if net_guide_builder is not None else _empty_guide
         self.likelihood_fwd = self.guided_likelihood
 
@@ -221,13 +252,21 @@ class VariationalBNN(_SupervisedBNN):
             self.likelihood_guide = _empty_guide
 
     def guide(self, x, obs=None, anneal_factor: float=1.0):
+        """
+        Guide(s) of net (and optionally likelihood) used for training.
+        """
         assert anneal_factor > 0.0, anneal_factor
+
         with poutine.scale(scale=anneal_factor):
             result = self.net_guide(*_as_tuple(x)) or {}
-            result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
+        result.update(self.likelihood_guide(*_as_tuple(x), obs) or {})
+
         return result
 
     def guided_forward(self, *args, guide_tr=None, **kwargs):
+        # Used for prediction, similar to pyro.infer.Predictive.
+        # conditions model on provided guide latent samples.
+        # does not forward likelihood
         if guide_tr is None:
             guide_tr = poutine.trace(self.net_guide).get_trace(*args, **kwargs)
         return poutine.replay(self.net, trace=guide_tr)(*args, **kwargs)
