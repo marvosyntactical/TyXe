@@ -103,8 +103,9 @@ class _ReparameterizationMessenger(Messenger):
             return
 
         if msg["done"]:
-            warnings.warn(f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
-                             f"Did you use multiple reparameterization messengers for the same function?")
+            # NOTE TODO uncomment in 0.0.6
+            # warnings.warn(f"Trying to reparameterize a {msg['fn'].__name__} site that has already been processed. "
+            #                  f"Did you use multiple reparameterization messengers for the same function?")
             return
 
         args = list(msg["args"])

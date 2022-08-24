@@ -214,10 +214,6 @@ class Categorical(_Discrete):
         """
         return predictions.var(dim=sample_dim)
 
-
-
-
-
 class Gaussian(Likelihood):
     """Base class for Gaussian likelihoods."""
 
@@ -273,7 +269,7 @@ class HeteroskedasticGaussian(Gaussian):
         # Means with lower predicted noise are given higher weight in the average.
         agg_loc = loc.mul(precision).sum(dim).div(total_precision)
         # Predictive variance is the variance of the means plus the average predicted variance.
-        agg_scale = precision.reciprocal().mean(dim).add(loc.var(dim)).sqrt()
+        agg_scale = precision.pow(2).mean(dim).add(loc.var(dim)).sqrt()
 
         if not self.positive_scale:
             agg_scale = inverse_softplus(agg_scale)
@@ -300,8 +296,6 @@ class HeteroskedasticGaussian(Gaussian):
         """
         loc, _ = predictions.chunk(2, dim=-1)
         return loc.var(dim=sample_dim)
-
-
 
 
 

@@ -197,11 +197,6 @@ class _SupervisedBNN(_BNN):
             return error, nll, predictive_variance, \
                     aleatoric_uncertainty, epistemic_uncertainty, sampled_predictions, net_predictions
 
-
-
-    # def likelihood_fwd(self, *args, **kwargs):
-    #     raise NotImplementedError
-
     def predict(self, *input_data, num_predictions=1, aggregate=True, net_only=False):
         """Makes predictions on the input data
 
@@ -420,24 +415,25 @@ class MCMC_BNN(_SupervisedBNN):
         """
         Args:
             net_only: only forward guided net, not likelihood
+            weight_samples: None or a Dictionary of site_name: sampled_parameter
         """
         if weight_samples is None:
             if self._mcmc is None:
                 raise RuntimeError("Provide weight samples or call .fit to run MCMC and obtain samples from the posterior first.")
             weight_samples = self._mcmc.get_samples(num_samples=num_predictions)
         else:
-            num_samples = len(list(weight_samples.keys())[0])
-            if num_predictions != num_samples:
-                (num_predictions, num_samples)
-            warnings.warn(f"Got num_predictions={num_predictions} and number of weight_samples={num_samples}. Adjusting num_predictions to {num_samples}")
-            num_predictions = num_samples
+            # num_samples = len(list(weight_samples.keys())[0])
+            # if num_predictions != num_samples:
+            #     (num_predictions, num_samples)
+            # warnings.warn(f"Got num_predictions={num_predictions} and number of weight_samples={num_samples}. Adjusting num_predictions to {num_samples}")
+            # num_predictions = num_samples
+            assert num_predictions == 1
 
         preds = []
         self.net.eval() # not doing monte carlo dropout
         with torch.no_grad():
             for i in range(num_predictions):
-                weights = {name: sample[i] for name, sample in weight_samples.items()}
-                pred = poutine.condition(self, weights)(*input_data)
+                pred = poutine.condition(self, weight_samples)(*input_data)
                 if not aggregate and not net_only:
                     pred = self.likelihood(pred)
                 preds.append(pred)
